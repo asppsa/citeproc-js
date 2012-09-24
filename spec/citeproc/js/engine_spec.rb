@@ -2,6 +2,15 @@
 
 require 'spec_helper'
 
+# We can't do testing without one of v8 or rhino.  In the case
+# of the former, we also need nokogiri.
+begin
+  require 'v8'
+rescue LoadError
+  require 'rhino'
+end
+require 'nokogiri'
+
 module CiteProc
   module JS
     describe 'Engine' do

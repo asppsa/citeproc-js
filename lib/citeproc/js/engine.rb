@@ -4,107 +4,82 @@ module CiteProc
 
     class Engine < CiteProc::Engine
 
+      extend Forwardable
+
       @name = 'citeproc-js'.freeze
       @type = 'CSL'.freeze
       @version = '1.0'
       @priority = 0
 
-      @path = File.expand_path('../support', __FILE__)
+      def initialize(processor=nil)
+        context['system'] = self
+ 
+        super(processor)
+      end
 
-      class << self
+      def path 
+        @path ||= File.expand_path('../support', __FILE__)
+      end
 
-        attr_reader :path
+      def context
+        unless @context 
+          if Object.const_defined? :V8
+            @context = V8::Context.new(:with => self)
+            # This could probably be used from Rhino too -- would it be
+            # slower though?
+          elsif Object.const_defined? :Rhino
+            @context = Rhino::Context.new(:with => self)
+            # Not sure that this does anything, as it's slow either way
+            @context.optimization_level = 0
+            #@context.load(File.join(path, 'xmle4x.js'))
+          else
+            raise "No javascript implementation available.  You must require one of 'v8' or 'rhino'"
+          end
 
-        def parser
-          ExecJS.runtime.name =~ /rhino|spidermonkey/i ? 'xmle4x.js' : 'xmldom.js'
-        end
+          @context['CSL_CHROME'] = NokogiriParser
 
-        # Returns the citeproc-js JavaScript code.
-        def source
-          @source || reload
-        end
-
-        # Forces a reload citeproc-js JavaScript code. Returns the source
-        # code.
-        def reload
-          @source = [
-            parser, 'citeproc.js', 'system.js'
-          ].map { |s| File.open(File.join(path,s), 'r:UTF-8').read }.join.freeze        
-        end
-
-        private
-
-        def attr_context(*arguments)
-          arguments.flatten.each do |m|
-            define_method(underscore(m)) do
-              delegate "citeproc.#{m}"
+          @context['Kernel'] = Kernel
+          @context.load(File.join(path,'citeproc.js'))
+          @context['CSL'].debug = lambda do |this, str| 
+            if str.is_a? String
+              puts 'DEBUG: ' + str
+            else
+              print 'DEBUG: '
+              p str
             end
           end
         end
 
-        def delegate_context(*arguments)
-          arguments.flatten.each do |m|
-            define_method(underscore(m)) do |*args|
-              delegate "citeproc.#{m}(#{args.map { |a| MultiJson.encode(a) }.join(',')})"
-            end
-          end
+        @context
+      end
+
+      def js_engine
+        unless @js_engine
+          @js_engine = context.eval('new CSL.Engine(this, style, lang)')
+          @js_engine.opt.development_extensions.field_hack = false
         end
 
-        def underscore(javascript_method)
-          word = javascript_method.to_s.split(/\./)[-1]
-          word.gsub!(/([A-Z]+)([A-Z][a-z])/, '\1_\2')
-          word.gsub!(/([a-z\d])([A-Z])/, '\1_\2')
-          word.downcase!
-          word
-        end
+        @js_engine
       end
 
+      def retrieve_item id
+        item = if id.is_a? String
+                 processor.items[id.to_sym]
+               else
+                 processor.items[id]
+               end
 
-
-      attr_context :processor_version, :csl_version, :opt
-
-      alias flags opt
-
-      delegate_context %w{ setOutputFormat updateItems updateUncitedItems
-        makeBibliography appendCitationCluster processCitationCluster
-        previewCitationCluster registry.getSortedRegistryItems }
-
-      alias format= set_output_format
-
-      alias sorted_registry_items get_sorted_registry_items
-
-      %w{ append process preview }.each do |m|
-        alias_method m, "#{m}_citation_cluster"
+        item.to_citeproc
       end
 
-      # Don't expose all delegates to public interface
-      private :opt, :append_citation_cluster, :process_citation_cluster,
-        :set_output_format, :make_bibliography, :preview_citation_cluster,
-        :get_sorted_registry_items
-
-      def registry
-        @registry ||= Hash.new { |h,k| delegate "citeproc.registry.#{k}" }
-      end
-
-      def citation_registry
-        @citation_registry ||= Hash.new { |h,k| registry["citationreg.#{k}"] }
-      end
-
-      # The processor's items converted to citeproc-js format
-      def items
-        Hash[*processor.items.map { |id, item|
-          [id.to_s, item.respond_to?(:to_citeproc) ? item.to_citeproc : item.to_s]
-        }.flatten]
-      end
-      
       # The locale put into a hash to make citeproc-js happy
-      def locales
-        { locale.name => locale.to_s }
+      def retrieve_locale lang
+        processor.locale.to_s
       end
       
       # Sets the abbreviation's namespace, both in Ruby and JS land
       def namespace=(namespace)
-        delegate "citeproc.setAbbreviations(#{ namespace.to_s.inspect })"
+        set_abbreviations(namespace)
         @namespace = namespace.to_sym
       end
 
@@ -115,36 +90,61 @@ module CiteProc
       def append(citation)
         append_citation_cluster(citation.to_citeproc, false)
       end
-      
-      private
 
-      def context
-        @context || compile_context
+      def style
+        processor.style.to_s
       end
 
-      def compile_context
-        @context = ExecJS.compile(Engine.source)
-        update_system(:abbreviations, :items, :locales)
-
-        delegate "citeproc = new CSL.Engine(system, #{style.to_s.inspect}, #{locale.name.inspect})", :exec
-        set_output_format(options[:format])
-
-        @context
-      rescue => e
-        raise EngineError, "failed to compile engine context: #{e.message}"
+      def lang
+        processor.locale.language
       end
 
-      def update_system(*arguments)
-        arguments = arguments.flatten.map { |a| [a, send(a)] }
-        delegate "system.update(#{ MultiJson.encode(Hash[*arguments.flatten]) })"
+      def flags
+        @flags ||= ObjectHash.new(js_engine.opt)
       end
 
-      def delegate(script, method = :eval)
-        context.send(method, script)
-      rescue => e
-        raise EngineError, "failed to execute javascript: #{e.message}"
+      def registry
+        @registry ||= ObjectHash.new(js_engine.registry)
       end
 
+      def sorted_registry_items
+        items = []
+        js_engine.registry.getSortedRegistryItems.each do |k,v|
+          items << v
+        end
+
+        items
+      end
+
+      class << self
+
+        def underscore(javascript_method)
+          word = javascript_method.to_s.split(/\./)[-1]
+          word.gsub!(/([A-Z]+)([A-Z][a-z])/, '\1_\2')
+          word.gsub!(/([a-z\d])([A-Z])/, '\1_\2')
+          word.downcase!
+          word
+        end
+
+      end
+
+      @js_methods = [:setOutputFormat, :updateItems, 
+        :updateUncitedItems, :makeBibliography,
+        :appendCitationCluster, :processCitationCluster,
+        :previewCitationCluster,
+        :setAbbreviations]
+
+      @js_methods.each do |method|
+        def_instance_delegator :js_engine, method, underscore(method)
+      end
+
+      def_instance_delegator :js_engine, :processor_version
+
+      alias retrieveLocale retrieve_locale
+      alias retrieveItem retrieve_item
+      alias getAbbreviations abbreviations
+
+      alias format= set_output_format
     end
 
   end
